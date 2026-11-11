@@ -1,0 +1,300 @@
+#!/bin/bash
+
+
+# CHANGE LOG
+# ----------
+# 2026-10-27	njeffrey	Script created
+# 2026-11-11	njeffrey	Remove any line breaks from $RESULT variable
+
+
+# NOTES
+# -----
+#
+# Nagios plugin to monitor Oracle tablespace utilization using SQL*Plus
+#
+# Requirements:
+#   - Oracle SQL*Plus installed (typically at /bin/sqlplus)
+#   - Oracle Easy Connect connectivity
+#   - Oracle view contains TABLESPACE_NAME and USED_PCT columns (created by DBA)
+#
+# If you need to install the Oracle Instant Client on the Nagios server, example commands below:
+# cd /tmp
+# echo Download the oracle instant client
+# wget https://download.oracle.com/otn_software/linux/instantclient/2326300/oracle-instantclient-basic-23.26.3.0.0-1.el9.x86_64.rpm
+# echo Also download some optional tools that will give you SQL*Plus
+# wget https://download.oracle.com/otn_software/linux/instantclient/2326300/oracle-instantclient-sqlplus-23.26.3.0.0-1.el9.x86_64.rpm
+# echo Optionally, also download Datapump, SQLLoader, workload replay client (not needed for this script)
+# wget https://download.oracle.com/otn_software/linux/instantclient/2326300/oracle-instantclient-tools-23.26.3.0.0-1.el9.x86_64.rpm
+# echo Installing Oracle Instant Client packages
+# yum install ./oracle-instant*rpm
+# echo Confirming location of sqlplus binary
+# which sqlplus ; ls -l /bin/sqlplus:
+
+
+# FUTURE ENHANCEMENTS
+# -------------------
+# 1) The SQL*Net username/password credentials are supplied as command-line parameters to this script,
+#    which means they may be visible in the process list.  Instead of providing as parameters, consider
+#    using a protected credential file.  This would change $ARG1$ and $ARG2$ argument to nagios variables $USER##$ $PASS##$ 
+#    so the credentials would not be visible in process lists.
+
+# USAGE
+# -----
+# Usage:
+#   check_oracle_tablespace \
+#      --username=USER \
+#      --password=PASSWORD \
+#      --hostaddress=HOST \
+#      [--port=PORT] \
+#      --service=SERVICE \
+#      --view=VIEW \
+#      [--warning=N] \
+#      [--critical=N]
+#
+# Example:
+#   check_oracle_tablespace \
+#      --username=nagios \
+#      --password='MySecretPass123' \
+#      --hostaddress=oracle-server.example.com \
+#      --port=1521 \
+#      --service=SOME-Oracle-Service-Name \
+#      --view=NAGIOS_TBLSPC_USAGE_VW \
+#      --warning=80 \
+#      --critical=90
+#
+# It is assumed you have a stanza similar to the following in the commands.cfg file on the nagios server:
+# define command {
+#   command_name    check_oracle_tablespace
+#   command_line    $USER1$/check_oracle_tablespace --username='$ARG1$' --password='$ARG2$' --hostaddress='$HOSTADDRESS$' --port='$ARG4$' --service='$ARG5$' --view='$ARG6$' --warning='$ARG7$' --critical='$ARG8$'
+#}
+#
+# It is assumed you have a stanza similar ot the following in the services.cfg file on the nagios server:
+#define service {
+#   use                     generic-service
+#   host_name               oracle-server
+#   service_description     Oracle Tablespace Utilization
+#   check_command           check_oracle_tablespace!SomeUser!SecretPass123!1521:ServiceName!ViewName!80!90
+#}
+
+
+
+# Define default values
+ORACLE_USER=""
+ORACLE_PASSWORD=""
+HOSTADDRESS=""
+PORT=1521
+SERVICE_NAME=""
+VIEW_NAME=""
+WARNING_THRESHOLD=80
+CRITICAL_THRESHOLD=90
+
+
+# Define Nagios return codes
+OK=0
+WARN=1
+CRITICAL=2
+UNKNOWN=3
+
+
+# Parse command-line arguments
+for ARG in "$@"; do
+   case "$ARG" in
+      --username=*)
+         ORACLE_USER="${ARG#*=}"
+         ;;
+      --password=*)
+         ORACLE_PASSWORD="${ARG#*=}"
+         ;;
+      --hostaddress=*)
+         HOSTADDRESS="${ARG#*=}"
+         ;;
+      --port=*)
+         PORT="${ARG#*=}"
+         ;;
+      --service=*)
+         SERVICE_NAME="${ARG#*=}"
+         ;;
+      --view=*)
+         VIEW_NAME="${ARG#*=}"
+         ;;
+      --warning=*)
+         WARNING_THRESHOLD="${ARG#*=}"
+         ;;
+      --critical=*)
+         CRITICAL_THRESHOLD="${ARG#*=}"
+         ;;
+      --help)
+         echo "Usage: $0 --username=USER --password=PASSWORD --hostaddress=HOST [--port=PORT] --service=SERVICE --view=VIEW [--warning=N] [--critical=N]"
+         exit $OK
+         ;;
+      *)
+         echo "UNKNOWN - Invalid argument: $ARG"
+         exit $UNKNOWN
+         ;;
+   esac
+done
+
+
+# Validate required arguments were provided
+if [ -z "$ORACLE_USER" ]     ||
+   [ -z "$ORACLE_PASSWORD" ] ||
+   [ -z "$HOSTADDRESS" ]     ||
+   [ -z "$SERVICE_NAME" ]    ||
+   [ -z "$VIEW_NAME" ]; then
+   echo "UNKNOWN - Missing required command-line argument"
+   exit $UNKNOWN
+fi
+
+
+# Validate thresholds
+if ! [[ "$WARNING_THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+   ! [[ "$CRITICAL_THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+   echo "UNKNOWN - Warning and critical thresholds must be numeric"
+   exit $UNKNOWN
+fi
+
+
+# Confirm warning threshold is less than critical threshold
+if ! awk -v w="$WARNING_THRESHOLD" -v c="$CRITICAL_THRESHOLD" \
+   'BEGIN { exit !(w < c && c <= 100) }'; then
+   echo "UNKNOWN - Thresholds must satisfy 0 <= warning < critical <= 100"
+   exit $UNKNOWN
+fi
+
+
+# Validate port
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] ||
+   [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+   echo "UNKNOWN - Invalid Oracle listener port: $PORT"
+   exit $UNKNOWN
+fi
+
+
+# Validate Oracle view name
+if ! [[ "$VIEW_NAME" =~ ^[A-Za-z][A-Za-z0-9_\$\#]*$ ]]; then
+   echo "UNKNOWN - Invalid Oracle view name: $VIEW_NAME"
+   exit $UNKNOWN
+fi
+
+
+# Check SQL*Plus availability
+if ! command -v sqlplus >/dev/null 2>&1; then
+   echo "UNKNOWN - sqlplus executable not found"
+   exit $UNKNOWN
+fi
+
+
+# Construct Oracle Easy Connect string
+CONNECT_STRING="//${HOSTADDRESS}:${PORT}/${SERVICE_NAME}"
+
+
+# Construct SQL query
+SQL_QUERY="SELECT TABLESPACE_NAME || ',' || USED_PCT FROM ${VIEW_NAME}"
+
+
+# Execute Oracle SQL query
+RESULT=$(sqlplus -s -L /nolog <<EOF
+WHENEVER OSERROR EXIT FAILURE
+WHENEVER SQLERROR EXIT FAILURE
+CONNECT ${ORACLE_USER}/"${ORACLE_PASSWORD}"@${CONNECT_STRING}
+SET HEADING OFF
+SET FEEDBACK OFF
+SET PAGESIZE 0
+SET LINESIZE 32767
+SET TRIMSPOOL ON
+SET VERIFY OFF
+SET ECHO OFF
+SET TAB OFF
+$SQL_QUERY;
+EXIT SUCCESS;
+EOF
+)
+RC=$?
+
+
+# Check Oracle errors, removing any line breaks to ensure we get the output in the nagios message
+# For example, if the credentials are incorrect, the output might be similar to:
+# UNKNOWN - Oracle SQL query failed: ERROR: ORA-28000: The account is locked.  Help: https://docs.oracle.com/error-help/db/ora-28000/
+#
+if [ "$RC" -ne 0 ] || echo "$RESULT" | grep -Eq 'ORA-|SP2-|TNS-'; then
+   RESULT=$(echo "$RESULT" | tr '\r\n' ' ' | tr -s ' ')
+   echo "UNKNOWN - Oracle SQL query failed: $RESULT"
+   exit $UNKNOWN
+fi
+
+
+STATUS=$OK
+MESSAGE=""
+PERFDATA=""
+COUNT=0
+WARN_COUNT=0
+CRIT_COUNT=0
+
+
+# Evaluate each tablespace
+while IFS=',' read -r TABLESPACE USED_PCT; do
+   #
+   # Skip empty lines
+   [ -z "$TABLESPACE" ] && continue
+   #
+   # Remove whitespace
+   TABLESPACE=$(echo "$TABLESPACE" | xargs)
+   USED_PCT=$(echo "$USED_PCT" | tr -d '[:space:]')
+   #
+   # Validate numeric result
+   if ! [[ "$USED_PCT" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      echo "UNKNOWN - Invalid utilization for $TABLESPACE: $USED_PCT"
+      exit $UNKNOWN
+   fi
+   #
+   # Increment counter variable for number of tables
+   COUNT=$((COUNT + 1))
+   #
+   if awk -v value="$USED_PCT" -v limit="$CRITICAL_THRESHOLD" 'BEGIN { exit !(value >= limit) }'; then
+      #
+      # Evaluate critical threshold
+      #
+      STATUS=$CRITICAL
+      CRIT_COUNT=$((CRIT_COUNT + 1))
+      MESSAGE="${MESSAGE}${TABLESPACE}=${USED_PCT}% CRITICAL, "
+   elif awk -v value="$USED_PCT" -v limit="$WARNING_THRESHOLD" 'BEGIN { exit !(value >= limit) }'; then
+      #
+      # Evaluate warning threshold
+      #
+      [ "$STATUS" -lt "$WARN" ] && STATUS=$WARN
+      WARN_COUNT=$((WARN_COUNT + 1))
+      MESSAGE="${MESSAGE}${TABLESPACE}=${USED_PCT}% WARNING, "
+   fi
+   #
+   # Generate performance data for every tablespace
+   PERFDATA="${PERFDATA}'${TABLESPACE}'=${USED_PCT}%;${WARNING_THRESHOLD};${CRITICAL_THRESHOLD};0;100 "
+done <<< "$RESULT"
+
+
+# Confirm query returned tablespaces
+if [ "$COUNT" -eq 0 ]; then
+   echo "UNKNOWN - Oracle query returned no tablespaces"
+   exit $UNKNOWN
+fi
+
+
+# Generate Nagios output
+case "$STATUS" in
+
+   $OK)
+      echo "OK - All $COUNT Oracle tablespaces below ${WARNING_THRESHOLD}% | $PERFDATA"
+      ;;
+
+   $WARN)
+      MESSAGE="${MESSAGE%, }"
+      echo "WARNING - $MESSAGE | $PERFDATA"
+      ;;
+
+   $CRITICAL)
+      MESSAGE="${MESSAGE%, }"
+      echo "CRITICAL - $MESSAGE | $PERFDATA"
+      ;;
+
+esac
+
+exit $STATUS
